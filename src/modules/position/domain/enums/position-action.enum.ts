@@ -1,0 +1,8 @@
+export enum PositionAction {
+  OPEN = 'OPEN',
+  INCREASE = 'INCREASE',
+  REDUCE = 'REDUCE',
+  CLOSE = 'CLOSE',
+  REVERSE = 'REVERSE',
+  PARTIAL_CLOSE = 'PARTIAL_CLOSE',
+}

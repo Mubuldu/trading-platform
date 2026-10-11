@@ -1,0 +1,207 @@
+# ────────────────────────────────────────────────────────────────────────────
+# docker-compose.cluster.yml — Horizontal scaling demo / local cluster
+#
+# Topology:
+#   nginx (load balancer, port 80)
+#     ↓
+#   api-1, api-2, api-3 (API nodes — also run workers)
+#     ↓
+#   redis-primary + redis-replica (Sentinel-style, single-host demo)
+#     ↓
+#   postgres-primary + postgres-replica (streaming replication)
+#
+# Usage:
+#   docker compose -f docker-compose.cluster.yml up --scale api=3
+#
+# Scaling a specific role (when workers are split out):
+#   docker compose -f docker-compose.cluster.yml up --scale api=3 --scale worker=5
+#
+# Environment:
+#   Copy .env.example → .env.cluster and set CLUSTER_ENABLED=true
+# ────────────────────────────────────────────────────────────────────────────
+
+version: '3.9'
+
+x-api-env: &api-env
+  NODE_ENV: production
+  CLUSTER_ENABLED: "true"
+  CLUSTER_HEARTBEAT_INTERVAL_MS: "3000"
+  CLUSTER_HEARTBEAT_TTL_MS: "10000"
+  CLUSTER_LEADER_LEASE_TTL_MS: "30000"
+  CLUSTER_LEADER_RENEWAL_INTERVAL_MS: "10000"
+  CLUSTER_TASK_DISTRIBUTION_STRATEGY: round-robin
+  CLUSTER_METRICS_PUBLISH_INTERVAL_MS: "5000"
+  REDIS_URL: redis://redis-primary:6379
+  REDIS_KEY_PREFIX: "tp:"
+  DB_HOST: postgres-primary
+  DB_PORT: "5432"
+  DB_NAME: trading_platform
+  DB_USER: trading
+  DB_SSL: "false"
+  DB_POOL_MIN: "2"
+  DB_POOL_MAX: "10"
+  DB_MIGRATE_ON_STARTUP: "true"
+  LOG_LEVEL: info
+  LOG_JSON_OUTPUT: "true"
+
+x-api-healthcheck: &api-healthcheck
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/v1/live"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 30s
+
+services:
+
+  # ── Load Balancer ──────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./docker/nginx/cluster.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
+    restart: unless-stopped
+    networks:
+      - trading
+
+  # ── API / Worker nodes ─────────────────────────────────────────────────────
+  # Run 1–100 replicas: docker compose up --scale api=10
+  api:
+    image: ghcr.io/trading-platform/api:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    environment:
+      <<: *api-env
+      # NODE_ID is left empty — each container resolves hostname:pid automatically
+      CLUSTER_WORKER_CAPABILITIES: "indicator,strategy,analytics,backtest,risk,execution"
+    env_file:
+      - .env.cluster
+    <<: *api-healthcheck
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+      postgres-primary:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - trading
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # ── Redis Primary ──────────────────────────────────────────────────────────
+  redis-primary:
+    image: redis:7.2-alpine
+    command: >
+      redis-server
+        --loglevel notice
+        --save 60 1
+        --appendonly yes
+        --appendfsync everysec
+        --maxmemory 2gb
+        --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-primary-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - trading
+
+  # ── Redis Replica (read replica for analytics read paths) ─────────────────
+  redis-replica:
+    image: redis:7.2-alpine
+    command: >
+      redis-server
+        --replicaof redis-primary 6379
+        --loglevel notice
+        --replica-read-only yes
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - trading
+
+  # ── Redis Sentinel (automatic failover) ───────────────────────────────────
+  redis-sentinel:
+    image: redis:7.2-alpine
+    command: >
+      redis-sentinel /etc/redis/sentinel.conf
+    volumes:
+      - ./docker/redis/sentinel.conf:/etc/redis/sentinel.conf:ro
+    depends_on:
+      - redis-primary
+      - redis-replica
+    restart: unless-stopped
+    networks:
+      - trading
+
+  # ── PostgreSQL Primary ────────────────────────────────────────────────────
+  postgres-primary:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: trading_platform
+      POSTGRES_USER: trading
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      # Enable WAL for streaming replication
+      POSTGRES_INITDB_ARGS: "--wal-level=replica"
+    volumes:
+      - postgres-primary-data:/var/lib/postgresql/data
+      - ./docker/postgres/primary-init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    secrets:
+      - db_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading -d trading_platform"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - trading
+
+  # ── PostgreSQL Read Replica ───────────────────────────────────────────────
+  postgres-replica:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: trading_platform
+      POSTGRES_USER: trading
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      PGUSER: trading
+    volumes:
+      - postgres-replica-data:/var/lib/postgresql/data
+      - ./docker/postgres/replica-init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    secrets:
+      - db_password
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - trading
+
+networks:
+  trading:
+    driver: bridge
+
+volumes:
+  redis-primary-data:
+  postgres-primary-data:
+  postgres-replica-data:
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt

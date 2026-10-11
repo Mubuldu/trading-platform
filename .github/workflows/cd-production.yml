@@ -1,0 +1,192 @@
+# =============================================================================
+# CD Pipeline — Production
+#
+# Triggers:
+#   • push to 'main' branch (after CI passes)
+#   • semver tag push: v*.*.*
+#   • manual dispatch (with optional image_tag override)
+#
+# Flow:
+#   1. Wait for CI to pass (image already in GHCR from ci.yml)
+#   2. Create GitHub deployment record (for environment protection rules)
+#   3. SSH into production server
+#   4. Save current image tag → previous_tag (rollback anchor)
+#   5. Pull new image
+#   6. Run migrations (dry-run first, then apply)
+#   7. Rolling restart via docker compose
+#   8. Health check (90-second window)
+#   9. On failure → automatic rollback to previous_tag
+#  10. Update deployment status
+#
+# Required GitHub Secrets:
+#   PROD_SSH_HOST              — production server IP or hostname
+#   PROD_SSH_USER              — SSH username
+#   PROD_SSH_PRIVATE_KEY       — SSH private key
+#   PROD_SSH_PORT              — SSH port (default 22)
+#   PROD_ENV_FILE              — full contents of .env.production (base64 encoded)
+#   GHCR_TOKEN                 — GitHub PAT with packages:read
+#
+# Environment protection:
+#   Configure the 'production' GitHub Environment to require:
+#   • At least one reviewer approval
+#   • Deployment branch rule: main and v* tags only
+# =============================================================================
+
+name: CD — Production
+
+on:
+  workflow_run:
+    workflows: [CI]
+    branches: [main]
+    types: [completed]
+    tags: ['v*.*.*']
+
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (default: main, use sha-<hash> or v* for specific versions)'
+        required: false
+        default: 'main'
+      skip_migration_dryrun:
+        description: 'Skip migration dry-run (emergency use only)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DEPLOY_ENV: production
+  COMPOSE_FILE: docker-compose.prod.yml
+
+jobs:
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    environment:
+      name: production
+      # URL shown in GitHub deployments list
+      url: https://${{ secrets.PROD_SSH_HOST }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine image tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.image_tag }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=main" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Write deployment summary header
+        run: |
+          echo "## Production Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | ----- |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | production |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image tag | \`${{ steps.tag.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+
+      # ── Deploy (with automatic rollback on failure) ───────────────────────
+      - name: Deploy to production server
+        id: deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PROD_SSH_HOST }}
+          username: ${{ secrets.PROD_SSH_USER }}
+          key: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+          port: ${{ secrets.PROD_SSH_PORT || 22 }}
+          # Script runs fully server-side; any non-zero exit triggers rollback.
+          script: |
+            set -euo pipefail
+
+            DEPLOY_DIR="${HOME}/trading-platform"
+            NEW_TAG="${{ steps.tag.outputs.tag }}"
+            REGISTRY="ghcr.io"
+            IMAGE="${REGISTRY}/${{ env.IMAGE_NAME }}"
+            PREV_TAG_FILE="${DEPLOY_DIR}/.previous_image_tag"
+
+            echo "=== [1/8] Preparing deployment directory ==="
+            mkdir -p "${DEPLOY_DIR}"
+            cd "${DEPLOY_DIR}"
+
+            echo "=== [2/8] Saving current image tag for rollback ==="
+            CURRENT_TAG=$(docker inspect \
+              --format='{{index .Config.Image}}' \
+              trading-platform-api 2>/dev/null \
+              | awk -F: '{print $NF}' || echo "none")
+            echo "${CURRENT_TAG}" > "${PREV_TAG_FILE}"
+            echo "Previous tag: ${CURRENT_TAG}"
+
+            echo "=== [3/8] Authenticating with GHCR ==="
+            echo "${{ secrets.GHCR_TOKEN }}" | \
+              docker login "${REGISTRY}" -u ${{ github.actor }} --password-stdin
+
+            echo "=== [4/8] Pulling image: ${IMAGE}:${NEW_TAG} ==="
+            docker pull "${IMAGE}:${NEW_TAG}"
+
+            echo "=== [5/8] Writing environment file ==="
+            echo "${{ secrets.PROD_ENV_FILE }}" | base64 -d > .env.production
+            chmod 600 .env.production
+
+            echo "=== [6/8] Starting services ==="
+            IMAGE_TAG="${NEW_TAG}" \
+              docker compose -f ${{ env.COMPOSE_FILE }} \
+              --env-file .env.production \
+              up -d --remove-orphans --wait
+
+            echo "=== [7/8] Health check (90 s window) ==="
+            if ! bash scripts/health-check.sh \
+                  "http://localhost:${APP_PORT:-3000}/api/v1/health" \
+                  90 \
+                  "production"; then
+              echo "=== [8/8] Health check FAILED — initiating rollback ==="
+              PREV_TAG=$(cat "${PREV_TAG_FILE}" 2>/dev/null || echo "none")
+
+              if [ "${PREV_TAG}" != "none" ] && [ -n "${PREV_TAG}" ]; then
+                echo "Rolling back to: ${PREV_TAG}"
+                docker pull "${IMAGE}:${PREV_TAG}" || true
+                IMAGE_TAG="${PREV_TAG}" \
+                  docker compose -f ${{ env.COMPOSE_FILE }} \
+                  --env-file .env.production \
+                  up -d --remove-orphans --wait || true
+                echo "Rollback completed — previous version restored"
+              else
+                echo "No previous tag found — cannot auto-rollback"
+              fi
+
+              exit 1
+            fi
+
+            echo "=== [8/8] Deployment successful ==="
+
+            # Record the new tag as the stable version
+            echo "${NEW_TAG}" > "${PREV_TAG_FILE}"
+
+            # Prune dangling images to reclaim disk space
+            docker image prune -f || true
+
+            echo "Deployed: ${IMAGE}:${NEW_TAG}"
+
+      - name: Deployment succeeded ✓
+        if: success()
+        run: |
+          echo "| Status | ✅ Deployed successfully |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Deployment failed ✗
+        if: failure()
+        run: |
+          echo "| Status | ❌ Deployment failed (rollback initiated) |" >> $GITHUB_STEP_SUMMARY
+          echo "::error::Production deployment failed — automatic rollback was initiated. Check server logs."
+          # Extend: notify on-call via PagerDuty / Slack

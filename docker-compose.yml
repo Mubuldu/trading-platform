@@ -1,0 +1,21 @@
+# =============================================================================
+# BASE COMPOSE — shared service definitions
+# Not used directly. Extended by docker-compose.dev.yml and
+# docker-compose.prod.yml via the 'extends' mechanism.
+# =============================================================================
+
+version: '3.9'
+
+networks:
+  trading-net:
+    driver: bridge
+    name: trading-platform-network
+
+volumes:
+  logs-data:
+    name: trading-platform-logs
+
+x-common-vars: &common-vars
+  APP_NAME: trading-platform
+  APP_VERSION: '1.0.0'
+  LOG_DIR: /app/logs

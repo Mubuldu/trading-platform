@@ -1,0 +1,395 @@
+# =============================================================================
+# CI Pipeline — Trading Platform
+#
+# Stages (run in dependency order):
+#   1. lint          — ESLint + Prettier format check
+#   2. typecheck     — TypeScript compiler (tsc --noEmit)
+#   3. unit-tests    — Jest unit tests with 80 % coverage gate
+#   4. integration-tests — Jest integration tests
+#   5. build         — NestJS production build
+#   6. security-scan — pnpm audit + Gitleaks secret scan
+#   7. docker        — Build image, scan with Trivy, push to GHCR
+#
+# Quality gates (any failure blocks merge):
+#   • ESLint: zero warnings
+#   • TypeScript: zero errors
+#   • Coverage: branches/functions/lines/statements ≥ 80 %
+#   • pnpm audit: no HIGH or CRITICAL vulnerabilities
+#   • Trivy: no CRITICAL vulnerabilities in final image
+#   • Gitleaks: no secrets detected
+#
+# Image push targets:
+#   • Push to GHCR on: main, develop, or any semver tag (v*)
+#   • All other branches: build only (no push)
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+  PNPM_VERSION: '9'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reusable setup steps are embedded inline; GitHub Actions does not support
+# anchors so each job repeats the checkout + pnpm + node setup.
+# ─────────────────────────────────────────────────────────────────────────────
+
+jobs:
+  # ── Stage 1: Lint ──────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: ESLint (zero warnings)
+        run: pnpm lint:check
+
+      - name: Prettier (format check)
+        run: pnpm format:check
+
+  # ── Stage 2: Type Check ────────────────────────────────────────────────────
+  typecheck:
+    name: Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: TypeScript — noEmit check
+        run: pnpm typecheck
+
+  # ── Stage 3: Unit Tests ────────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run unit tests (with coverage)
+        run: pnpm test:unit:ci
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-coverage-report
+          path: coverage/
+          retention-days: 14
+
+  # ── Stage 4: Integration Tests ─────────────────────────────────────────────
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: trading_platform_test
+          POSTGRES_USER: trading
+          POSTGRES_PASSWORD: trading_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U trading -d trading_platform_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run integration tests
+        env:
+          NODE_ENV: test
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_NAME: trading_platform_test
+          DB_USER: trading
+          DB_PASSWORD: trading_test_password
+          DB_SSL: 'false'
+          DB_MIGRATE_ON_STARTUP: 'false'
+          REDIS_URL: redis://localhost:6379
+          REDIS_KEY_PREFIX: 'tp:test:'
+        run: pnpm test:integration:ci
+
+  # ── Stage 5: Build ─────────────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Upload build artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 3
+
+  # ── Stage 6: Security Scan ─────────────────────────────────────────────────
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history needed for Gitleaks to scan all commits
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # ── Dependency audit ────────────────────────────────────────────────────
+      - name: pnpm audit (HIGH / CRITICAL)
+        run: pnpm audit --audit-level high
+        # If the project has known exceptions they should be managed via
+        # .pnpmfile.cjs or an allowlist — never downgrade the audit level.
+
+      # ── Secret scan ─────────────────────────────────────────────────────────
+      - name: Gitleaks — detect secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Gitleaks exits non-zero if any secret is found → job fails.
+        # Configure allowlist in .gitleaks.toml at the repo root.
+
+  # ── Stage 7: Docker Build + Push ───────────────────────────────────────────
+  docker:
+    name: Docker
+    runs-on: ubuntu-latest
+    # Run after all quality gates pass
+    needs: [unit-tests, integration-tests, build, security-scan]
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        # Only authenticate on branches/tags that we push to
+        if: >
+          github.ref == 'refs/heads/main' ||
+          github.ref == 'refs/heads/develop' ||
+          startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # semver tag  →  v1.2.3, 1.2.3, 1.2, 1
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            # branch push  →  main, develop, sha-abc1234
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+            # PR           →  pr-42 (no push)
+            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.title=trading-platform
+            org.opencontainers.image.description=Production-grade algorithmic trading platform
+
+      - name: Build image (+ push when on main/develop/tag)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime
+          # Push only on main, develop, or version tags
+          push: >-
+            ${{
+              github.ref == 'refs/heads/main' ||
+              github.ref == 'refs/heads/develop' ||
+              startsWith(github.ref, 'refs/tags/v')
+            }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.version'] }}
+          # Build cache from/to GHCR registry cache
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: >-
+            ${{
+              (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+              && format('type=registry,ref={0}/{1}:buildcache,mode=max', env.REGISTRY, env.IMAGE_NAME)
+              || ''
+            }}
+          platforms: linux/amd64
+
+      # ── Trivy container scan ────────────────────────────────────────────────
+      - name: Trivy — scan image for CRITICAL/HIGH CVEs
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+        # Only scan when we actually pushed an image
+        if: >
+          github.ref == 'refs/heads/main' ||
+          github.ref == 'refs/heads/develop' ||
+          startsWith(github.ref, 'refs/tags/v')
+
+      - name: Trivy SARIF upload (GitHub Security tab)
+        uses: aquasecurity/trivy-action@master
+        if: >
+          (github.ref == 'refs/heads/main' ||
+          github.ref == 'refs/heads/develop' ||
+          startsWith(github.ref, 'refs/tags/v')) &&
+          always()
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: sarif
+          output: trivy-results.sarif
+
+      - name: Upload Trivy SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: >
+          (github.ref == 'refs/heads/main' ||
+          github.ref == 'refs/heads/develop' ||
+          startsWith(github.ref, 'refs/tags/v')) &&
+          always()
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Output image digest
+        if: steps.build.outputs.digest != ''
+        run: |
+          echo "### Docker image pushed" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | ----- |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Digest | \`${{ steps.build.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tags | ${{ steps.meta.outputs.tags }} |" >> $GITHUB_STEP_SUMMARY

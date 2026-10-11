@@ -1,0 +1,49 @@
+# =============================================================================
+# Trading Platform — Development Dockerfile
+#
+# Features:
+#   • Hot-reload via @nestjs/cli --watch (ts-node)
+#   • Node.js debugger on port 9229 (bind 0.0.0.0 so VS Code can attach)
+#   • Source code mounted at runtime (see docker-compose.dev.yml)
+#   • All dev dependencies available (no pruning)
+#
+# Usage: see docker-compose.dev.yml — do not use this file directly.
+# =============================================================================
+
+FROM node:22-alpine
+
+WORKDIR /app
+
+# Install pnpm globally
+RUN npm install -g pnpm@11 --quiet --no-fund --no-audit
+
+# Copy manifests first — layer cache is reused unless these change
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+
+# Copy the local workspace SDK package so pnpm can link it during install.
+# The sdk/ directory is also volume-mounted at runtime (see docker-compose.dev.yml)
+# so live TypeScript edits to the SDK are visible to the compiler without rebuild.
+COPY sdk/ ./sdk/
+
+# Install all deps (dev included)
+RUN pnpm install --frozen-lockfile
+
+# Copy only the config files that don't change often.
+# Source (src/) is mounted as a read-only volume at runtime so the compiler
+# sees live edits without a rebuild.
+COPY tsconfig.json tsconfig.build.json nest-cli.json ./
+
+# ── Ports ─────────────────────────────────────────────────────────────────────
+# 3000 — HTTP API
+# 9229 — Node.js V8 Inspector (debugger)
+EXPOSE 3000 9229
+
+ENV NODE_ENV=development
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+  CMD wget -qO- http://localhost:${APP_PORT:-3000}/api/v1/health \
+      | grep -q '"status":"ok"' || exit 1
+
+# Start in watch mode with the debugger listening on all interfaces so that
+# the VS Code "Attach to Docker" launch config can connect from the host.
+CMD ["node", "node_modules/@nestjs/cli/bin/nest.js", "start", "--debug=0.0.0.0:9229", "--watch"]

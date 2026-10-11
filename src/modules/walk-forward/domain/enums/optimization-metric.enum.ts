@@ -1,0 +1,9 @@
+export enum OptimizationMetric {
+  SHARPE = 'SHARPE',
+  SORTINO = 'SORTINO',
+  NET_PROFIT = 'NET_PROFIT',
+  PROFIT_FACTOR = 'PROFIT_FACTOR',
+  WIN_RATE = 'WIN_RATE',
+  CALMAR = 'CALMAR',
+  EXPECTANCY = 'EXPECTANCY',
+}

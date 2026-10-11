@@ -1,0 +1,10 @@
+export enum BacktestState {
+  IDLE = 'IDLE',
+  LOADING = 'LOADING',
+  WARMING_UP = 'WARMING_UP',
+  RUNNING = 'RUNNING',
+  PAUSED = 'PAUSED',
+  COMPLETED = 'COMPLETED',
+  FAILED = 'FAILED',
+  CANCELLED = 'CANCELLED',
+}

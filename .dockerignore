@@ -1,0 +1,63 @@
+# =============================================================================
+# .dockerignore — build context exclusions
+#
+# Applied when 'context: .' is used in docker-compose files.
+# Keeps the build context small and prevents secrets from reaching the daemon.
+# =============================================================================
+
+# ── Dependencies (reinstalled inside the image) ───────────────────────────────
+node_modules/
+.pnpm-store/
+
+# ── Build outputs ─────────────────────────────────────────────────────────────
+dist/
+build/
+*.tsbuildinfo
+
+# ── Version control ───────────────────────────────────────────────────────────
+.git/
+.gitignore
+.github/
+
+# ── Secrets — NEVER send to the daemon ───────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Test artefacts ────────────────────────────────────────────────────────────
+tests/
+coverage/
+jest-e2e.config.ts
+jest.config.ts
+
+# ── Development tooling ───────────────────────────────────────────────────────
+.eslintrc.js
+.prettierrc
+.editorconfig
+
+# ── Runtime data ─────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Docs & scripts (not needed at runtime) ───────────────────────────────────
+docs/
+scripts/
+*.md
+README*
+CHANGELOG*
+CONTRIBUTING*
+LICENSE*
+
+# ── Docker files themselves ───────────────────────────────────────────────────
+docker-compose*.yml
+docker/.dockerignore
+
+# ── OS artefacts ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/

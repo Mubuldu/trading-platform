@@ -1,0 +1,151 @@
+# =============================================================================
+# STAGING COMPOSE
+#
+# Usage:
+#   IMAGE_TAG=develop docker compose -f docker-compose.staging.yml \
+#     --env-file .env.staging up -d
+#
+# Differences from production:
+#   - Self-hosted PostgreSQL (production uses a managed DB service)
+#   - Swagger enabled for team testing
+#   - Slightly lower resource limits
+#   - Restart policy: unless-stopped (vs always in prod)
+#   - All services on the same host
+# =============================================================================
+
+version: '3.9'
+
+networks:
+  trading-net:
+    driver: bridge
+    name: trading-platform-network-staging
+
+volumes:
+  logs-data:
+    name: trading-platform-logs-staging
+  redis-data:
+    name: trading-platform-redis-staging
+  postgres-data:
+    name: trading-platform-postgres-staging
+
+services:
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: trading-platform-postgres-staging
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-trading_platform_staging}
+      POSTGRES_USER: ${DB_USER:-trading}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - trading-net
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 128M
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${DB_USER:-trading} -d ${DB_NAME:-trading_platform_staging}']
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+    command: >
+      postgres
+      -c max_connections=50
+      -c shared_buffers=128MB
+      -c work_mem=4MB
+      -c log_min_duration_statement=500
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: trading-platform-redis-staging
+    restart: unless-stopped
+    command: >
+      redis-server
+      --save 300 10
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --loglevel warning
+    volumes:
+      - redis-data:/data
+    networks:
+      - trading-net
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          cpus: '0.3'
+        reservations:
+          memory: 128M
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  # ── API ─────────────────────────────────────────────────────────────────────
+  api:
+    image: ghcr.io/${GITHUB_REPOSITORY:-trading-platform/trading-platform}:${IMAGE_TAG:-develop}
+    container_name: trading-platform-api-staging
+    restart: unless-stopped
+    ports:
+      - '${HOST_PORT:-3000}:3000'
+    env_file:
+      - .env.staging
+    environment:
+      NODE_ENV: staging
+      # Override these in .env.staging; shown here for documentation
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      DB_MIGRATE_ON_STARTUP: 'true'
+      REDIS_URL: 'redis://redis:6379'
+      SWAGGER_ENABLED: 'true'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - logs-data:/app/logs
+    networks:
+      - trading-net
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.75'
+        reservations:
+          memory: 128M
+          cpus: '0.1'
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://localhost:3000/api/v1/health']
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 5

@@ -1,0 +1,70 @@
+# =============================================================================
+# TEST INFRASTRUCTURE COMPOSE
+#
+# Isolated ports — no conflict with docker-compose.dev.yml:
+#   PostgreSQL → 5433 (dev uses 5432)
+#   Redis      → 6380 (dev uses 6379)
+#
+# Usage:
+#   docker compose -f docker-compose.test.yml up -d --wait   # start + wait for health
+#   pnpm test:infra                                           # run infra integration tests
+#   docker compose -f docker-compose.test.yml down -v        # stop + wipe volumes
+#
+# IMPORTANT: This compose runs an ephemeral, single-node Redis with no AOF
+# persistence and a dedicated test database. It is safe to FLUSHDB between
+# test suites.
+# =============================================================================
+
+networks:
+  trading-test-net:
+    driver: bridge
+
+volumes:
+  redis-test-data:
+  postgres-test-data:
+
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    container_name: trading-platform-postgres-test
+    ports:
+      - '5433:5432'
+    environment:
+      POSTGRES_DB: trading_platform_test
+      POSTGRES_USER: trading
+      POSTGRES_PASSWORD: trading_dev_password
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-test-data:/var/lib/postgresql/data
+    networks:
+      - trading-test-net
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U trading -d trading_platform_test']
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+
+  redis-test:
+    image: redis:7-alpine
+    container_name: trading-platform-redis-test
+    ports:
+      - '6380:6379'
+    # No disk persistence — purely ephemeral for tests
+    command: >
+      redis-server
+      --save ""
+      --appendonly no
+      --loglevel warning
+      --maxmemory 128mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-test-data:/data
+    networks:
+      - trading-test-net
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      start_period: 5s
+      retries: 5

@@ -1,0 +1,140 @@
+# =============================================================================
+# CD Pipeline — Staging
+#
+# Trigger: push to 'develop' branch (after CI passes)
+#
+# Flow:
+#   1. Wait for CI to pass (image already in GHCR from ci.yml)
+#   2. SSH into staging server
+#   3. Pull latest image (ghcr.io/<org>/<repo>:develop)
+#   4. Run database migrations
+#   5. Rolling restart via docker compose
+#   6. Health check (60-second window, polling /api/v1/health)
+#   7. Notify on success or failure
+#
+# Required GitHub Secrets:
+#   STAGING_SSH_HOST         — staging server IP or hostname
+#   STAGING_SSH_USER         — SSH username (e.g. deploy)
+#   STAGING_SSH_PRIVATE_KEY  — SSH private key (ed25519 recommended)
+#   STAGING_SSH_PORT         — SSH port (default 22)
+#   STAGING_ENV_FILE         — full contents of .env.staging (base64 encoded)
+#   GHCR_TOKEN               — GitHub Personal Access Token with packages:read
+#                              (or use GITHUB_TOKEN for same org repos)
+# =============================================================================
+
+name: CD — Staging
+
+on:
+  # Trigger after CI succeeds on the develop branch
+  workflow_run:
+    workflows: [CI]
+    branches: [develop]
+    types: [completed]
+
+  # Allow manual trigger (e.g. to re-deploy without a new commit)
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (default: develop)'
+        required: false
+        default: 'develop'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DEPLOY_ENV: staging
+  COMPOSE_FILE: docker-compose.staging.yml
+  APP_URL: http://${{ secrets.STAGING_SSH_HOST }}:3000
+
+jobs:
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    # Only proceed when CI passed (for workflow_run trigger)
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    environment:
+      name: staging
+      url: ${{ env.APP_URL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine image tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.image_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=develop" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Write deployment summary header
+        run: |
+          echo "## Staging Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | ----- |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | staging |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image tag | \`${{ steps.tag.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Deploy to staging server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_SSH_HOST }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          port: ${{ secrets.STAGING_SSH_PORT || 22 }}
+          script: |
+            set -euo pipefail
+
+            DEPLOY_DIR="${HOME}/trading-platform"
+            IMAGE_TAG="${{ steps.tag.outputs.tag }}"
+            REGISTRY="ghcr.io"
+            IMAGE="${REGISTRY}/${{ env.IMAGE_NAME }}"
+
+            echo "=== [1/6] Preparing deployment directory ==="
+            mkdir -p "${DEPLOY_DIR}"
+            cd "${DEPLOY_DIR}"
+
+            echo "=== [2/6] Authenticating with GHCR ==="
+            echo "${{ secrets.GHCR_TOKEN }}" | \
+              docker login "${REGISTRY}" -u ${{ github.actor }} --password-stdin
+
+            echo "=== [3/6] Pulling image: ${IMAGE}:${IMAGE_TAG} ==="
+            docker pull "${IMAGE}:${IMAGE_TAG}"
+
+            echo "=== [4/6] Writing environment file ==="
+            # Decode and write the staging env file
+            echo "${{ secrets.STAGING_ENV_FILE }}" | base64 -d > .env.staging
+            chmod 600 .env.staging
+
+            echo "=== [5/6] Starting services ==="
+            IMAGE_TAG="${IMAGE_TAG}" \
+              docker compose -f ${{ env.COMPOSE_FILE }} \
+              --env-file .env.staging \
+              up -d --remove-orphans --wait
+
+            echo "=== [6/6] Deployment complete — running health check ==="
+            bash scripts/health-check.sh \
+              "http://localhost:${APP_PORT:-3000}/api/v1/health" \
+              60 \
+              "staging"
+
+      - name: Health check passed ✓
+        run: |
+          echo "| Health | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "| Health | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          echo "::error::Staging deployment failed — check logs above"
+          # Extend here: curl to Slack webhook, PagerDuty, etc.
+          # Example:
+          # curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+          #   -H "Content-Type: application/json" \
+          #   -d '{"text":"❌ Staging deployment failed for commit ${{ github.sha }}"}'

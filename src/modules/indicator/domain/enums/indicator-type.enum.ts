@@ -1,0 +1,17 @@
+export enum IndicatorType {
+  EMA = 'ema',
+  SMA = 'sma',
+  ATR = 'atr',
+  RSI = 'rsi',
+  ADX = 'adx',
+  VWAP = 'vwap',
+  DONCHIAN = 'donchian',
+  BOLLINGER = 'bollinger',
+  MACD = 'macd',
+  SUPERTREND = 'supertrend',
+  VOLUME_MA = 'volume_ma',
+  VOLUME_SPIKE = 'volume_spike',
+  TRUE_RANGE = 'true_range',
+  HIGHEST_HIGH = 'highest_high',
+  LOWEST_LOW = 'lowest_low',
+}

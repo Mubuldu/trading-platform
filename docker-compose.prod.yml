@@ -1,0 +1,111 @@
+# =============================================================================
+# PRODUCTION COMPOSE
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# IMPORTANT: Never commit .env files with real secrets. Pass secrets via
+# Docker secrets, Vault, or a secrets manager and reference them here.
+#
+# Features:
+#  - Multi-stage production image (no dev tools, non-root user)
+#  - Restart policy: always
+#  - Log rotation configured at the Docker daemon level
+#  - No debug ports exposed
+#  - Swagger disabled
+# =============================================================================
+
+version: '3.9'
+
+networks:
+  trading-net:
+    driver: bridge
+    name: trading-platform-network-prod
+
+volumes:
+  logs-data:
+    name: trading-platform-logs-prod
+  redis-data:
+    name: trading-platform-redis-prod
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: trading-platform-redis
+    restart: always
+    command: >
+      redis-server
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 1gb
+      --maxmemory-policy allkeys-lru
+      --loglevel warning
+    volumes:
+      - redis-data:/data
+    networks:
+      - trading-net
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.1'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 15s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: runtime
+    image: trading-platform:${IMAGE_TAG:-latest}
+    container_name: trading-platform-api
+    restart: always
+    ports:
+      - '${HOST_PORT:-3000}:3000'
+    env_file:
+      - .env.production
+    environment:
+      NODE_ENV: production
+      SWAGGER_ENABLED: 'false'
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - logs-data:/app/logs
+    networks:
+      - trading-net
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+        reservations:
+          memory: 128M
+          cpus: '0.25'
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://localhost:3000/api/v1/health']
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 5

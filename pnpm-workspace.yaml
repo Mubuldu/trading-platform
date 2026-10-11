@@ -1,0 +1,19 @@
+packages:
+  - 'sdk/*'
+
+allowBuilds:
+  '@nestjs/core': true
+
+# Force patched versions of vulnerable transitive dependencies.
+# multer <2.1.0: DoS via incomplete cleanup / resource exhaustion (GHSA-xf7r-hgr6-v32p, GHSA-v52c-386h-88mc)
+# body-parser <1.20.6: DoS via specially crafted payload (GHSA-v422-hmwv-36x6)
+# qs >=6.11.1 <=6.15.1: prototype pollution (GHSA-xxx) — via express
+# js-yaml <4.3.1: YAML merge-key ReDoS / quadratic CPU (GHSA-...) — via @nestjs/swagger
+# file-type <21.3.1: type confusion (GHSA-...) — via @nestjs/common
+overrides:
+  multer: '>=2.1.0'
+  body-parser: '>=1.20.6'
+  qs: '>=6.15.2'
+  js-yaml: '>=4.3.1'
+  file-type: '>=21.3.1'
+  lodash: '>=4.18.0'

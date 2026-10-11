@@ -1,0 +1,6 @@
+export enum RiskProfileType {
+  CONSERVATIVE = 'CONSERVATIVE',
+  BALANCED = 'BALANCED',
+  AGGRESSIVE = 'AGGRESSIVE',
+  CUSTOM = 'CUSTOM',
+}
