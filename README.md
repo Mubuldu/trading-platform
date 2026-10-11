@@ -1,0 +1,2 @@
+# trading-platform
+trade bot
