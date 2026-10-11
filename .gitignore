@@ -44,3 +44,12 @@ Thumbs.db
 
 # Deployment state (written by deploy.sh — server-side only)
 .previous_image_tag
+
+# Large backtest data files
+ml-service/data/*.json
+*.json.gz
+
+# Environment variables
+.env
+.env.local
+.env.*.local
